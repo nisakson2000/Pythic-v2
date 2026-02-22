@@ -1,0 +1,39 @@
+# Environment variables (secrets)
+.env
+
+# Runtime files
+bot.log
+player_messages.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Bundled FFmpeg (Windows)
+ffmpeg/
+
+# Claude Code
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
