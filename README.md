@@ -5,9 +5,12 @@ A full-featured Discord music bot that plays music from YouTube with interactive
 ## Features
 
 - **Playback Controls**: play, pause, resume, stop, skip, previous, restart, seek
-- **Queue Management**: view queue, shuffle, remove songs, clear
+- **Queue Management**: view queue, shuffle, remove, move, clear with pagination
+- **Playlist Support**: load full YouTube playlists, supports all URL formats
+- **Search & Select**: search YouTube and pick from top 10 results via dropdown
+- **Play Next**: insert a song at the front of the queue
 - **Loop Modes**: off, single track, entire queue
-- **Volume Control**: 0-100%
+- **Volume Control**: 0-100% with persistence across bot restarts
 - **Interactive Player**: embedded now-playing display with button controls
 - **Progress Tracking**: real-time progress bar and time remaining
 - **Auto-Recovery**: automatically retries playback on connection errors
@@ -63,7 +66,8 @@ All commands use Discord's slash command system (type `/` to see them).
 
 | Command | Description |
 |---------|-------------|
-| `/play <query>` | Play a song from YouTube (supports search or URL) |
+| `/play <query>` | Play a song or playlist from YouTube (search, URL, or playlist) |
+| `/playnext <query>` | Add a song to play next in the queue |
 | `/pause` | Pause the current song |
 | `/resume` | Resume playback |
 | `/stop` | Stop playing and clear the queue |
@@ -80,6 +84,7 @@ All commands use Discord's slash command system (type `/` to see them).
 | `/nowplaying` | Show the currently playing song with controls |
 | `/refresh` | Refresh the player to show current progress |
 | `/shuffle` | Shuffle the queue |
+| `/move <from> <to>` | Move a song to a different position in the queue |
 | `/remove <position>` | Remove a song from the queue |
 | `/clear` | Clear the entire queue |
 | `/loop <mode>` | Set loop mode (off/one/all) |
