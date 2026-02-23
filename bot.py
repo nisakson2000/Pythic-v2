@@ -9,6 +9,13 @@ import asyncio
 
 load_dotenv()
 
+# Validate token early
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+if not DISCORD_TOKEN:
+    print("ERROR: DISCORD_TOKEN environment variable is not set.")
+    print("Create a .env file with: DISCORD_TOKEN=your_token_here")
+    sys.exit(1)
+
 # Set up logging to file only (no console output)
 logging.basicConfig(
     level=logging.DEBUG,
@@ -25,19 +32,13 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix="?", intents=intents)
 
+_cleanup_done = False
+
 
 @bot.event
 async def on_ready():
     logger.info(f"{bot.user} is now online!")
     print(f"{bot.user} is now online!")
-    try:
-        synced = await bot.tree.sync()
-        logger.info(f"Synced {len(synced)} slash commands")
-        print(f"Synced {len(synced)} slash commands")
-    except Exception as e:
-        logger.error(f"Failed to sync commands: {e}", exc_info=True)
-        print(f"Failed to sync commands: {e}")
-
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.listening,
         name="/play"
@@ -45,9 +46,24 @@ async def on_ready():
     print("Bot ready!")
 
 
+@bot.command(name="sync")
+@commands.is_owner()
+async def sync_commands(ctx):
+    """Owner-only command to sync slash commands with Discord"""
+    try:
+        synced = await bot.tree.sync()
+        await ctx.send(f"Synced {len(synced)} slash commands.")
+        logger.info(f"Synced {len(synced)} slash commands")
+    except Exception as e:
+        await ctx.send(f"Failed to sync: {e}")
+        logger.error(f"Failed to sync commands: {e}", exc_info=True)
+
+
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
+        return
+    elif isinstance(error, commands.NotOwner):
         return
     elif isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(f"Missing argument: {error.param.name}")
@@ -69,6 +85,10 @@ async def on_app_command_error(interaction: discord.Interaction, error):
 
 async def cleanup():
     """Clean up all player messages before shutdown"""
+    global _cleanup_done
+    if _cleanup_done:
+        return
+    _cleanup_done = True
     logger.info("Cleaning up before shutdown...")
     music_cog = bot.get_cog('Music')
     if music_cog:
@@ -79,8 +99,7 @@ async def cleanup():
 
 
 async def main():
-    # Set up signal handlers for graceful shutdown
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def signal_handler():
         logger.info("Received shutdown signal")
@@ -99,7 +118,7 @@ async def main():
     async with bot:
         await bot.load_extension("cogs.music")
         try:
-            await bot.start(os.getenv("DISCORD_TOKEN"))
+            await bot.start(DISCORD_TOKEN)
         except asyncio.CancelledError:
             pass
         finally:

@@ -4,6 +4,7 @@
 # Runtime files
 bot.log
 player_messages.json
+guild_settings.json
 
 # Python
 __pycache__/

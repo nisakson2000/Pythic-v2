@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Workflow
+
+After completing changes, always commit and push to the remote repository.
+
 ## Commands
 
 ```bash
@@ -31,7 +35,9 @@ This is a Discord music bot built with discord.py that plays audio from YouTube.
 
 ### Key Classes in `cogs/music.py`
 
-**Song** - Data class representing a playable track (source URL, title, webpage URL, duration, thumbnail)
+**Song** - Data class representing a playable track (source URL, title, webpage URL, duration, thumbnail, fetched_at). Has `refresh_source()` method for JIT URL re-fetching when cached URLs expire (>1 hour).
+
+**SongSelectView** - Discord UI dropdown for search-and-select when `/play` query is text (not a URL). Shows top 5 results with 30s timeout.
 
 **MusicPlayer** - Per-guild state container holding:
 - `queue` (deque of Songs)
@@ -47,9 +53,15 @@ This is a Discord music bot built with discord.py that plays audio from YouTube.
 
 ### Audio Pipeline
 1. `get_song()` uses yt-dlp to extract audio URL from YouTube
-2. `discord.FFmpegPCMAudio` streams audio through local FFmpeg binary
-3. `discord.PCMVolumeTransformer` applies volume control
-4. `play_next()` handles queue progression, loop modes, and error recovery
+2. `Song.refresh_source()` re-fetches expired audio URLs just-in-time (called before every playback)
+3. `discord.FFmpegPCMAudio` streams audio through local FFmpeg binary
+4. `discord.PCMVolumeTransformer` applies volume control
+5. `play_next()` (sync shim) → `_play_next_async()` handles queue progression, loop modes, and error recovery
+
+### Playlist Support
+- Detects playlist URLs (`list=` or `/playlist`) in `/play` and `/playnext`
+- `get_playlist_songs()` uses flat extraction (`YDL_PLAYLIST_OPTIONS`) to quickly get metadata
+- Songs are queued with `source=None` -- audio URLs are JIT-fetched via `refresh_source()` at play time
 
 ### Error Recovery
 - `play_next()` detects premature song endings caused by YouTube 403 errors or streaming failures
@@ -91,9 +103,15 @@ The bot includes several optimizations to prevent audio issues like speed-up gli
 - 0.5 second delay after joining voice channel allows the connection to stabilize before playback
 - Applied to both `/join` and `/play` commands when connecting to a new channel
 
+### Volume Persistence
+- `guild_settings.json` stores per-guild settings (currently volume)
+- Loaded when creating a new `MusicPlayer` for a guild
+- Saved on `/volume` command
+
 ### Generated Files
 - `bot.log` - Debug logging output (recreated on each run)
 - `player_messages.json` - Tracks active player embeds for cleanup on restart
+- `guild_settings.json` - Per-guild settings (volume, etc.)
 
 ### Environment Variables
 - `DISCORD_TOKEN` (required) - Bot authentication token
@@ -107,7 +125,8 @@ The bot includes several optimizations to prevent audio issues like speed-up gli
 4. If a change would break existing behavior, ask the user first
 
 Protected commands that should not be removed or have their core functionality changed without explicit user request:
-- `/play` - Play a song
+- `/play` - Play a song or playlist
+- `/playnext` - Add a song to play next
 - `/pause` - Pause playback
 - `/resume` - Resume playback
 - `/stop` - Stop and clear queue
@@ -121,6 +140,7 @@ Protected commands that should not be removed or have their core functionality c
 - `/loop` - Set loop mode
 - `/seek` - Seek to position
 - `/remove` - Remove from queue
+- `/move` - Move song in queue
 - `/clear` - Clear queue
 - `/join` - Join voice channel
 - `/leave` - Leave voice channel

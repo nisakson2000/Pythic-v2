@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import random
+import re
 import subprocess
 import time
 import json
@@ -20,6 +21,8 @@ logger = logging.getLogger('discord-bot.music')
 
 # File to persist player message IDs for cleanup on restart
 PLAYER_MESSAGES_FILE = Path(__file__).parent.parent / "player_messages.json"
+# File to persist per-guild settings (volume, etc.)
+GUILD_SETTINGS_FILE = Path(__file__).parent.parent / "guild_settings.json"
 
 # Determine FFmpeg path based on platform
 def get_ffmpeg_path() -> str:
@@ -55,29 +58,68 @@ YDL_SEARCH_OPTIONS = {
     'noplaylist': True,
     'quiet': True,
     'no_warnings': True,
-    'default_search': 'ytsearch5',
+    'default_search': 'ytsearch10',
     'extract_flat': True,
+}
+
+YDL_PLAYLIST_OPTIONS = {
+    'quiet': True,
+    'no_warnings': True,
+    'extract_flat': True,
+    'source_address': '0.0.0.0',
 }
 
 FFMPEG_OPTIONS = {
     'before_options': '-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx',
     'options': '-vn -sn -dn',  # Disable video, subtitle, and data streams for cleaner audio
-    'stderr': subprocess.DEVNULL,  # Suppress FFmpeg error output from terminal
 }
 
 
 class Song:
-    def __init__(self, source: str, title: str, url: str, duration: int, thumbnail: str):
+    def __init__(self, source: str, title: str, url: str, duration: int, thumbnail: str, http_headers: dict = None):
         self.source = source
         self.title = title
         self.url = url
         self.duration = duration
         self.thumbnail = thumbnail
+        self.http_headers = http_headers or {}
+        self.fetched_at: float = time.time()
+
+    async def refresh_source(self, force: bool = False):
+        """Re-fetch the audio URL if it's older than 1 hour (or if forced)."""
+        if self.source is not None and not force:
+            age = time.time() - self.fetched_at
+            if age < 3600:
+                return
+        loop = asyncio.get_running_loop()
+        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+            info = await loop.run_in_executor(
+                None, lambda: ydl.extract_info(self.url, download=False)
+            )
+            if 'entries' in info:
+                info = info['entries'][0]
+            self.source = info['url']
+            self.http_headers = info.get('http_headers', {})
+            if not self.thumbnail:
+                self.thumbnail = info.get('thumbnail', '')
+            self.fetched_at = time.time()
+
+    def get_ffmpeg_options(self) -> dict:
+        """Build FFmpeg options including User-Agent for this song's source URL."""
+        before = FFMPEG_OPTIONS['before_options']
+        ua = self.http_headers.get('User-Agent', '') if self.http_headers else ''
+        if ua:
+            before = f'{before} -user_agent "{ua}"'
+        return {
+            'before_options': before,
+            'options': FFMPEG_OPTIONS['options'],
+        }
 
     @staticmethod
-    def format_duration(seconds: int) -> str:
+    def format_duration(seconds) -> str:
         if not seconds:
             return "0:00"
+        seconds = int(seconds)
         minutes, secs = divmod(seconds, 60)
         hours, minutes = divmod(minutes, 60)
         if hours:
@@ -157,8 +199,11 @@ class PlayerView(discord.ui.View):
         if not player.history:
             return await interaction.response.send_message("No previous songs!", ephemeral=True)
 
+        await interaction.response.defer()
+
         previous_song = player.history.pop()
         if player.current:
+            player.current.source = None  # Invalidate interrupted song's URL
             player.queue.appendleft(player.current)
         player.current = previous_song
 
@@ -166,19 +211,18 @@ class PlayerView(discord.ui.View):
             player.skip_next_callback = True
             vc.stop()
 
-        source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **FFMPEG_OPTIONS)
+        await player.current.refresh_source(force=True)  # Force fresh URL from history
+        source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **player.current.get_ffmpeg_options())
         source = discord.PCMVolumeTransformer(source, volume=player.volume)
         player.start_time = time.time()
         player.is_paused = False
         vc.play(source, after=lambda e: self.cog.play_next(self.guild_id, vc, interaction.channel, error=e))
 
-        await interaction.response.defer()
-
         # Delete old player message
         if player.player_message:
             try:
                 await player.player_message.delete()
-            except:
+            except Exception:
                 pass
 
         # Send text message for history, then new embed below it
@@ -221,6 +265,8 @@ class PlayerView(discord.ui.View):
         if player.loop_mode == "one":
             player.loop_mode = "off"
 
+        player.start_time = 0  # Prevent premature end detection on intentional skip
+        player.retry_count = 0
         await interaction.response.send_message("⏭️ Skipped!", ephemeral=True)
         vc.stop()
 
@@ -258,7 +304,7 @@ class PlayerView(discord.ui.View):
         # Delete the now playing message silently
         try:
             await interaction.message.delete()
-        except:
+        except Exception:
             pass
 
     @discord.ui.button(emoji="🔄", style=discord.ButtonStyle.secondary, row=1)
@@ -271,6 +317,69 @@ class PlayerView(discord.ui.View):
         await self._update_embed(interaction)
 
 
+class SongSelectView(discord.ui.View):
+    """Dropdown for selecting from search results"""
+    def __init__(self, cog: 'Music', results: List[dict], interaction: discord.Interaction):
+        super().__init__(timeout=30)
+        self.cog = cog
+        self.interaction = interaction
+        self.selected_url: Optional[str] = None
+
+        options = []
+        for i, r in enumerate(results[:10], 1):
+            options.append(discord.SelectOption(
+                label=r['title'][:100],
+                value=r['url'],
+                description=f"Result #{i}",
+            ))
+
+        select = discord.ui.Select(placeholder="Pick a song...", options=options)
+        select.callback = self.select_callback
+        self.add_item(select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        self.selected_url = interaction.data['values'][0]
+        await interaction.response.defer()
+        self.stop()
+
+    async def on_timeout(self):
+        try:
+            await self.interaction.edit_original_response(content="Search timed out.", view=None)
+        except Exception:
+            pass
+
+
+class QueuePaginationView(discord.ui.View):
+    """Pagination buttons for the queue display"""
+    def __init__(self, cog: 'Music', guild_id: int, current_page: int, total_pages: int):
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.current_page = current_page
+        self.total_pages = total_pages
+
+    @discord.ui.button(emoji="◀️", style=discord.ButtonStyle.secondary)
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page > 0:
+            self.current_page -= 1
+        player = self.cog.get_player(self.guild_id)
+        self.total_pages = max(1, (len(player.queue) + 9) // 10)
+        embed = self.cog._build_queue_embed(player, self.current_page)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(emoji="▶️", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page < self.total_pages - 1:
+            self.current_page += 1
+        player = self.cog.get_player(self.guild_id)
+        self.total_pages = max(1, (len(player.queue) + 9) // 10)
+        embed = self.cog._build_queue_embed(player, self.current_page)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_timeout(self):
+        pass
+
+
 class Music(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -280,6 +389,13 @@ class Music(commands.Cog):
     async def cog_load(self):
         """Called when the cog is loaded - clean up any orphaned player messages from previous sessions"""
         await self._cleanup_orphaned_messages()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Ensure all slash commands are used in a guild, not DMs"""
+        if interaction.guild is None:
+            await interaction.response.send_message("This command can only be used in a server!", ephemeral=True)
+            return False
+        return True
 
     def _save_player_message(self, guild_id: int, channel_id: int, message_id: int):
         """Save player message info to file for cleanup on restart"""
@@ -337,9 +453,39 @@ class Music(commands.Cog):
         except Exception as e:
             logger.error(f"Error during orphaned message cleanup: {e}")
 
+    def _load_guild_settings(self, guild_id: int) -> dict:
+        """Load settings for a guild from persistent storage"""
+        try:
+            if GUILD_SETTINGS_FILE.exists():
+                with open(GUILD_SETTINGS_FILE, 'r') as f:
+                    data = json.load(f)
+                return data.get(str(guild_id), {})
+        except Exception as e:
+            logger.error(f"Error loading guild settings: {e}")
+        return {}
+
+    def _save_guild_setting(self, guild_id: int, key: str, value):
+        """Save a single setting for a guild"""
+        try:
+            data = {}
+            if GUILD_SETTINGS_FILE.exists():
+                with open(GUILD_SETTINGS_FILE, 'r') as f:
+                    data = json.load(f)
+            if str(guild_id) not in data:
+                data[str(guild_id)] = {}
+            data[str(guild_id)][key] = value
+            with open(GUILD_SETTINGS_FILE, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            logger.error(f"Error saving guild setting: {e}")
+
     def get_player(self, guild_id: int) -> MusicPlayer:
         if guild_id not in self.players:
-            self.players[guild_id] = MusicPlayer()
+            player = MusicPlayer()
+            settings = self._load_guild_settings(guild_id)
+            if 'volume' in settings:
+                player.volume = settings['volume']
+            self.players[guild_id] = player
         return self.players[guild_id]
 
     async def cleanup_player(self, guild_id: int):
@@ -393,17 +539,17 @@ class Music(commands.Cog):
                 if text_channel:
                     try:
                         await text_channel.send("👋 Disconnected due to inactivity.")
-                    except:
+                    except Exception:
                         pass
 
         self.disconnect_tasks[guild_id] = asyncio.create_task(disconnect_after_delay())
 
     async def search_songs(self, query: str) -> List[dict]:
         """Search YouTube and return list of results for autocomplete"""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             with yt_dlp.YoutubeDL(YDL_SEARCH_OPTIONS) as ydl:
-                info = await loop.run_in_executor(None, lambda: ydl.extract_info(f"ytsearch5:{query}", download=False))
+                info = await loop.run_in_executor(None, lambda: ydl.extract_info(f"ytsearch10:{query}", download=False))
                 if 'entries' in info:
                     return [{'title': e['title'][:80], 'url': e['url']} for e in info['entries'] if e]
         except Exception:
@@ -412,7 +558,7 @@ class Music(commands.Cog):
 
     async def get_song(self, query: str) -> Optional[Song]:
         """Get full song info from URL or search query"""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
             try:
                 if not query.startswith(('http://', 'https://')):
@@ -425,13 +571,61 @@ class Music(commands.Cog):
                     title=info['title'],
                     url=info['webpage_url'],
                     duration=info.get('duration', 0),
-                    thumbnail=info.get('thumbnail', '')
+                    thumbnail=info.get('thumbnail', ''),
+                    http_headers=info.get('http_headers', {}),
                 )
             except Exception as e:
                 logger.error(f"Error getting song: {e}")
                 return None
 
+    @staticmethod
+    def _is_playlist_url(url: str) -> bool:
+        """Check if a URL is a YouTube playlist"""
+        return bool(re.search(r'[?&]list=|/playlist\?', url))
+
+    async def get_playlist_songs(self, url: str) -> List[Song]:
+        """Extract songs from a YouTube playlist using flat extraction (no audio URLs yet)"""
+        # Normalize watch?v=...&list= URLs to /playlist?list= format
+        list_match = re.search(r'[?&]list=([\w-]+)', url)
+        if list_match and '/playlist' not in url:
+            url = f'https://www.youtube.com/playlist?list={list_match.group(1)}'
+        loop = asyncio.get_running_loop()
+        try:
+            with yt_dlp.YoutubeDL(YDL_PLAYLIST_OPTIONS) as ydl:
+                info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
+                if 'entries' not in info:
+                    return []
+                songs = []
+                for entry in info['entries']:
+                    if not entry:
+                        continue
+                    entry_url = entry.get('url') or entry.get('webpage_url', '')
+                    # Build thumbnail from video ID if not provided by flat extraction
+                    thumb = entry.get('thumbnail', '')
+                    if not thumb:
+                        vid_id = entry.get('id', '')
+                        if vid_id:
+                            thumb = f'https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg'
+                    songs.append(Song(
+                        source=None,  # Will be JIT-fetched at play time
+                        title=entry.get('title', 'Unknown'),
+                        url=entry_url,
+                        duration=entry.get('duration', 0) or 0,
+                        thumbnail=thumb,
+                    ))
+                return songs
+        except Exception as e:
+            logger.error(f"Error extracting playlist: {e}")
+            return []
+
     def play_next(self, guild_id: int, voice_client: discord.VoiceClient, text_channel: discord.TextChannel, announce: bool = True, error: Exception = None):
+        """Sync shim called from FFmpeg's after= callback. Schedules async work."""
+        asyncio.run_coroutine_threadsafe(
+            self._play_next_async(guild_id, voice_client, text_channel, announce=announce, error=error),
+            self.bot.loop
+        )
+
+    async def _play_next_async(self, guild_id: int, voice_client: discord.VoiceClient, text_channel: discord.TextChannel, announce: bool = True, error: Exception = None):
         player = self.get_player(guild_id)
 
         # Log any playback errors
@@ -448,9 +642,6 @@ class Music(commands.Cog):
         if player.current and player.start_time > 0 and player.retry_count < 2:
             elapsed = time.time() - player.start_time
             expected_duration = player.current.duration
-            # Detect failure if:
-            # 1. Song ended in less than 15 seconds (FFmpeg retry timeout) AND song should be longer than 20s
-            # 2. OR song played less than 20% of its expected duration (for shorter songs)
             is_premature_end = (
                 (elapsed < 15 and expected_duration > 20) or
                 (expected_duration > 0 and elapsed < expected_duration * 0.2 and elapsed < 30)
@@ -458,18 +649,15 @@ class Music(commands.Cog):
             if is_premature_end:
                 logger.warning(f"Song ended prematurely ({elapsed:.1f}s of {expected_duration}s), likely playback error. Retry {player.retry_count + 1}/2...")
                 player.retry_count += 1
-                # Retry playing the same song by re-fetching the URL
-                asyncio.run_coroutine_threadsafe(
-                    self._retry_current_song(guild_id, voice_client, text_channel),
-                    self.bot.loop
-                )
+                await self._retry_current_song(guild_id, voice_client, text_channel)
                 return
 
         # Reset retry count on successful playback or when moving to next song
         player.retry_count = 0
 
         if player.loop_mode == "one" and player.current:
-            source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **FFMPEG_OPTIONS)
+            await player.current.refresh_source()
+            source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **player.current.get_ffmpeg_options())
             source = discord.PCMVolumeTransformer(source, volume=player.volume)
             voice_client.play(source, after=lambda e: self.play_next(guild_id, voice_client, text_channel, error=e))
             player.start_time = time.time()
@@ -484,29 +672,20 @@ class Music(commands.Cog):
 
         if not player.queue:
             player.current = None
-            # Clean up player message and start auto-disconnect timer when queue ends
-            asyncio.run_coroutine_threadsafe(
-                self.cleanup_player(guild_id),
-                self.bot.loop
-            )
-            asyncio.run_coroutine_threadsafe(
-                self.start_disconnect_timer(guild_id, voice_client),
-                self.bot.loop
-            )
+            await self.cleanup_player(guild_id)
+            await self.start_disconnect_timer(guild_id, voice_client)
             return
 
         player.current = player.queue.popleft()
-        source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **FFMPEG_OPTIONS)
+        await player.current.refresh_source()
+        source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **player.current.get_ffmpeg_options())
         source = discord.PCMVolumeTransformer(source, volume=player.volume)
         voice_client.play(source, after=lambda e: self.play_next(guild_id, voice_client, text_channel, error=e))
         player.start_time = time.time()
         player.is_paused = False
 
         if announce:
-            asyncio.run_coroutine_threadsafe(
-                self.send_now_playing(guild_id, text_channel, player.current),
-                self.bot.loop
-            )
+            await self.send_now_playing(guild_id, text_channel, player.current)
 
     async def _retry_current_song(self, guild_id: int, voice_client: discord.VoiceClient, text_channel: discord.TextChannel):
         """Retry playing the current song by re-fetching the URL"""
@@ -522,18 +701,16 @@ class Music(commands.Cog):
             logger.warning("Voice client disconnected, cannot retry")
             return
 
-        # Re-fetch the song to get a fresh URL
-        fresh_song = await self.get_song(player.current.url)
-        if fresh_song:
-            player.current = fresh_song
-            source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **FFMPEG_OPTIONS)
+        try:
+            await player.current.refresh_source(force=True)
+            source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **player.current.get_ffmpeg_options())
             source = discord.PCMVolumeTransformer(source, volume=player.volume)
             player.start_time = time.time()
             voice_client.play(source, after=lambda e: self.play_next(guild_id, voice_client, text_channel, error=e))
-        else:
+        except Exception:
             logger.warning("Failed to retry song, skipping to next")
-            player.retry_count = 0  # Reset before moving to next song
-            self.play_next(guild_id, voice_client, text_channel)
+            player.retry_count = 0
+            await self._play_next_async(guild_id, voice_client, text_channel)
 
     def create_now_playing_embed(self, player: MusicPlayer) -> discord.Embed:
         """Create a premium-styled now playing embed"""
@@ -628,62 +805,150 @@ class Music(commands.Cog):
         results = await self.search_songs(current)
         return [
             app_commands.Choice(name=r['title'][:100], value=r['url'])
-            for r in results[:5]
+            for r in results[:10]
         ]
 
-    @app_commands.command(name="play", description="Play a song from YouTube")
-    @app_commands.describe(query="Song name or YouTube URL")
-    @app_commands.autocomplete(query=song_autocomplete)
-    async def play(self, interaction: discord.Interaction, query: str):
+    async def _ensure_voice(self, interaction: discord.Interaction) -> Optional[discord.VoiceClient]:
+        """Connect to voice if needed, return voice client or None on failure. Assumes interaction is already deferred."""
         if not interaction.user.voice:
-            return await interaction.response.send_message("You must be in a voice channel!", ephemeral=True)
-
-        await interaction.response.defer()
-
+            await interaction.followup.send("You must be in a voice channel!", ephemeral=True)
+            return None
         voice_client = interaction.guild.voice_client
         if not voice_client:
             try:
                 voice_client = await interaction.user.voice.channel.connect(timeout=30.0)
-                # Brief delay to allow voice connection to stabilize
                 await asyncio.sleep(0.5)
             except asyncio.TimeoutError:
-                return await interaction.followup.send("Failed to connect to voice channel. Check bot permissions.")
+                await interaction.followup.send("Failed to connect to voice channel. Check bot permissions.")
+                return None
             except Exception as e:
-                return await interaction.followup.send(f"Failed to connect: {str(e)}")
+                await interaction.followup.send(f"Failed to connect: {str(e)}")
+                return None
+        return voice_client
 
+    async def _enqueue_and_play(self, interaction: discord.Interaction, voice_client: discord.VoiceClient, song: Song, front: bool = False):
+        """Add a song to queue and start playback if idle. front=True inserts at front."""
         player = self.get_player(interaction.guild.id)
-        self.cancel_disconnect_timer(interaction.guild.id)  # Cancel any pending disconnect
-        player.retry_count = 0  # Reset retry counter for new song request
-        player.text_channel = interaction.channel  # Track channel for notifications
-        song = await self.get_song(query)
+        self.cancel_disconnect_timer(interaction.guild.id)
+        player.retry_count = 0
+        player.text_channel = interaction.channel
 
-        if not song:
-            return await interaction.followup.send("Could not find the song.")
+        if front and (voice_client.is_playing() or voice_client.is_paused()):
+            player.queue.appendleft(song)
+            await interaction.followup.send(f"⏭️ **Playing next:** {song.title}")
+        elif not voice_client.is_playing() and not voice_client.is_paused():
+            player.queue.append(song)
+            await self._play_next_async(interaction.guild.id, voice_client, interaction.channel, announce=False)
 
-        player.queue.append(song)
-
-        if not voice_client.is_playing() and not voice_client.is_paused():
-            self.play_next(interaction.guild.id, voice_client, interaction.channel, announce=False)
-
-            # Delete old player message if exists
             if player.player_message:
                 try:
                     await player.player_message.delete()
-                except:
+                except Exception:
                     pass
 
-            # Send text message for chat history
             await interaction.followup.send(f"▶️ **Now Playing:** {song.title}")
 
-            # Send premium embed with player controls
             embed = self.create_now_playing_embed(player)
             view = PlayerView(self, interaction.guild.id, player.is_paused)
             player.player_message = await interaction.channel.send(embed=embed, view=view)
             self._save_player_message(interaction.guild.id, interaction.channel.id, player.player_message.id)
         else:
-            # Show queued song info as text
+            player.queue.append(song)
             position = len(player.queue)
             await interaction.followup.send(f"📋 **Added to Queue:** {song.title} (#{position})")
+
+    async def _handle_play(self, interaction: discord.Interaction, query: str, front: bool = False):
+        """Shared logic for /play and /playnext"""
+        if not interaction.user.voice:
+            return await interaction.response.send_message("You must be in a voice channel!", ephemeral=True)
+
+        await interaction.response.defer()
+
+        voice_client = await self._ensure_voice(interaction)
+        if not voice_client:
+            return
+
+        player = self.get_player(interaction.guild.id)
+        player.text_channel = interaction.channel
+
+        # Playlist handling
+        if query.startswith(('http://', 'https://')) and self._is_playlist_url(query):
+            songs = await self.get_playlist_songs(query)
+            if not songs:
+                return await interaction.followup.send("Could not load playlist.")
+
+            self.cancel_disconnect_timer(interaction.guild.id)
+            player.retry_count = 0
+
+            if front:
+                # Add in reverse so first song ends up first
+                for song in reversed(songs):
+                    player.queue.appendleft(song)
+            else:
+                player.queue.extend(songs)
+
+            if not voice_client.is_playing() and not voice_client.is_paused():
+                await self._play_next_async(interaction.guild.id, voice_client, interaction.channel, announce=False)
+
+                if player.player_message:
+                    try:
+                        await player.player_message.delete()
+                    except Exception:
+                        pass
+
+                first_title = player.current.title if player.current else songs[0].title
+                await interaction.followup.send(f"▶️ **Now Playing:** {first_title}\n📋 Added **{len(songs)}** songs from playlist")
+
+                embed = self.create_now_playing_embed(player)
+                view = PlayerView(self, interaction.guild.id, player.is_paused)
+                player.player_message = await interaction.channel.send(embed=embed, view=view)
+                self._save_player_message(interaction.guild.id, interaction.channel.id, player.player_message.id)
+            else:
+                await interaction.followup.send(f"📋 Added **{len(songs)}** songs from playlist")
+            return
+
+        # Search-select: if query is not a URL and not from autocomplete, show search results
+        is_url = query.startswith(('http://', 'https://'))
+        is_autocomplete = is_url  # autocomplete returns URLs
+
+        if not is_autocomplete:
+            results = await self.search_songs(query)
+            if not results:
+                return await interaction.followup.send("No results found.")
+
+            if len(results) > 1:
+                view = SongSelectView(self, results, interaction)
+                msg = await interaction.followup.send("Pick a song:", view=view)
+                timed_out = await view.wait()
+
+                if timed_out or not view.selected_url:
+                    return
+
+                query = view.selected_url
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+            else:
+                query = results[0]['url']
+
+        song = await self.get_song(query)
+        if not song:
+            return await interaction.followup.send("Could not find the song.")
+
+        await self._enqueue_and_play(interaction, voice_client, song, front=front)
+
+    @app_commands.command(name="play", description="Play a song from YouTube")
+    @app_commands.describe(query="Song name or YouTube URL")
+    @app_commands.autocomplete(query=song_autocomplete)
+    async def play(self, interaction: discord.Interaction, query: str):
+        await self._handle_play(interaction, query, front=False)
+
+    @app_commands.command(name="playnext", description="Add a song to play next in the queue")
+    @app_commands.describe(query="Song name or YouTube URL")
+    @app_commands.autocomplete(query=song_autocomplete)
+    async def playnext(self, interaction: discord.Interaction, query: str):
+        await self._handle_play(interaction, query, front=True)
 
     @app_commands.command(name="join", description="Join your voice channel")
     async def join(self, interaction: discord.Interaction):
@@ -764,6 +1029,8 @@ class Music(commands.Cog):
         if player.loop_mode == "one":
             player.loop_mode = "off"
 
+        player.start_time = 0  # Prevent premature end detection on intentional skip
+        player.retry_count = 0
         vc.stop()
         await interaction.response.send_message("Skipped")
 
@@ -782,7 +1049,8 @@ class Music(commands.Cog):
         player.skip_next_callback = True
         vc.stop()
 
-        source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **FFMPEG_OPTIONS)
+        await player.current.refresh_source()
+        source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **player.current.get_ffmpeg_options())
         source = discord.PCMVolumeTransformer(source, volume=player.volume)
 
         player.start_time = time.time()
@@ -808,6 +1076,7 @@ class Music(commands.Cog):
 
         # Put current song back at the front of the queue if there is one
         if player.current:
+            player.current.source = None  # Invalidate interrupted song's URL
             player.queue.appendleft(player.current)
 
         player.current = previous_song
@@ -817,7 +1086,8 @@ class Music(commands.Cog):
             player.skip_next_callback = True
             vc.stop()
 
-        source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **FFMPEG_OPTIONS)
+        await player.current.refresh_source(force=True)  # Force fresh URL from history
+        source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **player.current.get_ffmpeg_options())
         source = discord.PCMVolumeTransformer(source, volume=player.volume)
 
         player.start_time = time.time()
@@ -826,12 +1096,12 @@ class Music(commands.Cog):
         vc.play(source, after=lambda e: self.play_next(interaction.guild.id, vc, interaction.channel, error=e))
         await interaction.followup.send(f"Now playing: **{player.current.title}**")
 
-    @app_commands.command(name="queue", description="Show the current queue")
-    async def queue(self, interaction: discord.Interaction):
-        player = self.get_player(interaction.guild.id)
-
-        if not player.current and not player.queue:
-            return await interaction.response.send_message("The queue is empty!", ephemeral=True)
+    def _build_queue_embed(self, player: MusicPlayer, page: int = 0) -> discord.Embed:
+        """Build a queue embed for the given page (10 songs per page)."""
+        per_page = 10
+        queue_list_full = list(player.queue)
+        total_pages = max(1, (len(queue_list_full) + per_page - 1) // per_page)
+        page = max(0, min(page, total_pages - 1))
 
         embed = discord.Embed(title="Music Queue", color=discord.Color.blue())
 
@@ -842,18 +1112,36 @@ class Music(commands.Cog):
                 inline=False
             )
 
-        if player.queue:
+        if queue_list_full:
+            start = page * per_page
+            end = start + per_page
             queue_list = []
-            for i, song in enumerate(list(player.queue)[:10], 1):
+            for i, song in enumerate(queue_list_full[start:end], start + 1):
                 queue_list.append(f"`{i}.` {song.title} [{Song.format_duration(song.duration)}]")
-
-            if len(player.queue) > 10:
-                queue_list.append(f"... and {len(player.queue) - 10} more")
 
             embed.add_field(name="Up Next", value="\n".join(queue_list), inline=False)
 
-        embed.set_footer(text=f"Loop: {player.loop_mode} | Volume: {int(player.volume * 100)}%")
-        await interaction.response.send_message(embed=embed)
+        total_duration = sum(s.duration for s in player.queue)
+        if player.current:
+            total_duration += player.current.duration
+        duration_str = Song.format_duration(total_duration)
+        embed.set_footer(text=f"{len(player.queue)} songs | {duration_str} total | Page {page + 1}/{total_pages} | Loop: {player.loop_mode} | Volume: {int(player.volume * 100)}%")
+        return embed
+
+    @app_commands.command(name="queue", description="Show the current queue")
+    async def queue(self, interaction: discord.Interaction):
+        player = self.get_player(interaction.guild.id)
+
+        if not player.current and not player.queue:
+            return await interaction.response.send_message("The queue is empty!", ephemeral=True)
+
+        embed = self._build_queue_embed(player, page=0)
+        total_pages = max(1, (len(player.queue) + 9) // 10)
+        if total_pages > 1:
+            view = QueuePaginationView(self, interaction.guild.id, current_page=0, total_pages=total_pages)
+            await interaction.response.send_message(embed=embed, view=view)
+        else:
+            await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="nowplaying", description="Show the currently playing song")
     async def nowplaying(self, interaction: discord.Interaction):
@@ -866,7 +1154,7 @@ class Music(commands.Cog):
         if player.player_message:
             try:
                 await player.player_message.delete()
-            except:
+            except Exception:
                 pass
 
         embed = self.create_now_playing_embed(player)
@@ -891,7 +1179,7 @@ class Music(commands.Cog):
         try:
             await player.player_message.edit(embed=embed, view=view)
             await interaction.response.send_message("🔄 Player refreshed!", ephemeral=True)
-        except:
+        except Exception:
             await interaction.response.send_message("Couldn't refresh player. Use /nowplaying instead.", ephemeral=True)
 
     @app_commands.command(name="volume", description="Set the volume (0-100)")
@@ -906,6 +1194,7 @@ class Music(commands.Cog):
         if interaction.guild.voice_client.source:
             interaction.guild.voice_client.source.volume = player.volume
 
+        self._save_guild_setting(interaction.guild.id, 'volume', player.volume)
         await interaction.response.send_message(f"Volume set to **{level}%**")
 
     @app_commands.command(name="shuffle", description="Shuffle the queue")
@@ -974,13 +1263,11 @@ class Music(commands.Cog):
         player.skip_next_callback = True
         vc.stop()
 
-        ffmpeg_options = {
-            'before_options': f'-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -ss {seconds}',
-            'options': '-vn -sn -dn',
-            'stderr': subprocess.DEVNULL,
-        }
+        await player.current.refresh_source()
+        seek_options = player.current.get_ffmpeg_options()
+        seek_options['before_options'] += f' -ss {seconds}'
 
-        source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **ffmpeg_options)
+        source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **seek_options)
         source = discord.PCMVolumeTransformer(source, volume=player.volume)
 
         player.start_time = time.time() - seconds
@@ -1016,6 +1303,30 @@ class Music(commands.Cog):
         player.queue.clear()
         await interaction.response.send_message("Queue cleared!")
 
+    @app_commands.command(name="move", description="Move a song to a different position in the queue")
+    @app_commands.describe(from_pos="Current position of the song", to_pos="New position for the song")
+    async def move(self, interaction: discord.Interaction, from_pos: int, to_pos: int):
+        player = self.get_player(interaction.guild.id)
+
+        if not player.queue:
+            return await interaction.response.send_message("The queue is empty!", ephemeral=True)
+
+        max_pos = len(player.queue)
+        if not (1 <= from_pos <= max_pos) or not (1 <= to_pos <= max_pos):
+            return await interaction.response.send_message(
+                f"Positions must be between 1 and {max_pos}",
+                ephemeral=True
+            )
+
+        if from_pos == to_pos:
+            return await interaction.response.send_message("Song is already at that position!", ephemeral=True)
+
+        queue_list = list(player.queue)
+        song = queue_list.pop(from_pos - 1)
+        queue_list.insert(to_pos - 1, song)
+        player.queue = deque(queue_list)
+        await interaction.response.send_message(f"Moved **{song.title}** from #{from_pos} to #{to_pos}")
+
     @app_commands.command(name="help", description="Show all available commands")
     async def help(self, interaction: discord.Interaction):
         embed = discord.Embed(
@@ -1028,7 +1339,8 @@ class Music(commands.Cog):
         embed.add_field(
             name="🎵 Playback",
             value=(
-                "`/play <query>` - Play a song from YouTube\n"
+                "`/play <query>` - Play a song or playlist from YouTube\n"
+                "`/playnext <query>` - Add a song to play next\n"
                 "`/pause` - Pause the current song\n"
                 "`/resume` - Resume the paused song\n"
                 "`/stop` - Stop playing and clear the queue\n"
@@ -1048,6 +1360,7 @@ class Music(commands.Cog):
                 "`/nowplaying` - Show the currently playing song\n"
                 "`/refresh` - Refresh the player to show current progress\n"
                 "`/shuffle` - Shuffle the queue\n"
+                "`/move <from> <to>` - Move a song in the queue\n"
                 "`/remove <position>` - Remove a song from queue\n"
                 "`/clear` - Clear the entire queue\n"
                 "`/loop <mode>` - Set loop mode (off/one/all)"
@@ -1080,7 +1393,7 @@ class Music(commands.Cog):
                 if player and player.text_channel:
                     try:
                         await player.text_channel.send("👋 Disconnected from voice channel.")
-                    except:
+                    except Exception:
                         pass
                 # Clean up player state
                 await self.cleanup_player(guild_id)
