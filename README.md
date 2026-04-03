@@ -15,7 +15,6 @@ A full-featured Discord music bot that plays music from YouTube with interactive
 - **Progress Tracking**: real-time progress bar and time remaining
 - **Auto-Recovery**: automatically retries playback on connection errors
 - **Auto-Cleanup**: player embeds are cleaned up when playback stops or bot restarts
-- **Auto-Disconnect**: leaves voice channel after 2 minutes of inactivity
 
 ## Requirements
 
