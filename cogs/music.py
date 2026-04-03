@@ -131,17 +131,25 @@ class MusicPlayer:
         self.history: deque[Song] = deque(maxlen=50)  # Track up to 50 previous songs
         self.current: Optional[Song] = None
         self.volume: float = 0.5
-        self.loop_mode: str = "off"  # off, one, all
+        self.loop_mode: str = LOOP_OFF
         self.start_time: float = 0
         self.paused_time: float = 0
         self.is_paused: bool = False
         self.skip_next_callback: bool = False  # Prevents play_next from running when manually stopping
         self.player_message: Optional[discord.Message] = None  # Track the current embedded player message
         self.retry_count: int = 0  # Track retry attempts for failed playback
+        self.consecutive_failures: int = 0  # Track consecutive song playback failures
         self.text_channel: Optional[discord.TextChannel] = None  # Track last used text channel for notifications
 
 
 AUTO_DISCONNECT_DELAY = 120  # Seconds to wait before disconnecting when idle
+MAX_CONSECUTIVE_FAILURES = 5  # Stop playback after this many consecutive song failures
+
+# Loop mode constants
+LOOP_OFF = "off"
+LOOP_ONE = "one"
+LOOP_ALL = "all"
+LOOP_MODES = [LOOP_OFF, LOOP_ONE, LOOP_ALL]
 
 
 class PlayerView(discord.ui.View):
@@ -158,10 +166,10 @@ class PlayerView(discord.ui.View):
         # Update pause/play button emoji
         self.pause_resume_button.emoji = "▶️" if is_paused else "⏸️"
         # Update loop button style based on mode
-        if player.loop_mode == "off":
+        if player.loop_mode == LOOP_OFF:
             self.loop_button.style = discord.ButtonStyle.secondary
             self.loop_button.emoji = "🔁"
-        elif player.loop_mode == "one":
+        elif player.loop_mode == LOOP_ONE:
             self.loop_button.style = discord.ButtonStyle.success
             self.loop_button.emoji = "🔂"
         else:  # all
@@ -260,8 +268,8 @@ class PlayerView(discord.ui.View):
             return await interaction.response.send_message("Nothing is playing!", ephemeral=True)
 
         player = self.cog.get_player(self.guild_id)
-        if player.loop_mode == "one":
-            player.loop_mode = "off"
+        if player.loop_mode == LOOP_ONE:
+            player.loop_mode = LOOP_OFF
 
         player.start_time = 0  # Prevent premature end detection on intentional skip
         player.retry_count = 0
@@ -272,14 +280,14 @@ class PlayerView(discord.ui.View):
     async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.cog.get_player(self.guild_id)
         # Cycle through loop modes: off -> one -> all -> off
-        if player.loop_mode == "off":
-            player.loop_mode = "one"
+        if player.loop_mode == LOOP_OFF:
+            player.loop_mode = LOOP_ONE
             msg = "🔂 Looping current song"
-        elif player.loop_mode == "one":
-            player.loop_mode = "all"
+        elif player.loop_mode == LOOP_ONE:
+            player.loop_mode = LOOP_ALL
             msg = "🔁 Looping queue"
         else:
-            player.loop_mode = "off"
+            player.loop_mode = LOOP_OFF
             msg = "Loop disabled"
 
         await interaction.response.defer()
@@ -389,10 +397,11 @@ class Music(commands.Cog):
         self.bot = bot
         self.players: dict[int, MusicPlayer] = {}
         self.disconnect_tasks: dict[int, asyncio.Task] = {}  # Track disconnect timers per guild
+        self._cleanup_task: Optional[asyncio.Task] = None
 
     async def cog_load(self):
         """Called when the cog is loaded - schedule orphaned message cleanup for after bot connects"""
-        self.bot.loop.create_task(self._deferred_cleanup())
+        self._cleanup_task = self.bot.loop.create_task(self._deferred_cleanup())
 
     async def _deferred_cleanup(self):
         """Wait for bot to be ready (channel cache populated), then clean up orphaned messages"""
@@ -513,6 +522,8 @@ class Music(commands.Cog):
 
     async def cog_unload(self):
         """Called when the cog is unloaded (bot shutdown, cog reload, etc.)"""
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
         # Clean up all player messages
         for guild_id in list(self.players.keys()):
             await self.cleanup_player(guild_id)
@@ -669,26 +680,22 @@ class Music(commands.Cog):
         # Reset retry count on successful playback or when moving to next song
         player.retry_count = 0
 
-        if player.loop_mode == "one" and player.current:
+        if player.loop_mode == LOOP_ONE and player.current:
             try:
                 await player.current.refresh_source()
                 if not voice_client or not voice_client.is_connected():
                     return
-                source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **player.current.get_ffmpeg_options())
-                source = discord.PCMVolumeTransformer(source, volume=player.volume)
-                voice_client.play(source, after=lambda e: self.play_next(guild_id, voice_client, text_channel, error=e))
-                player.start_time = time.time()
+                self._start_playback(player, guild_id, voice_client, text_channel)
                 return
             except Exception as e:
                 logger.warning(f"Failed to loop song '{player.current.title}': {e}, falling through to next")
-                player.loop_mode = "off"
-                # Fall through to normal queue progression
+                player.loop_mode = LOOP_OFF
 
         # Add current song to history before moving on
         if player.current:
             player.history.append(player.current)
 
-        if player.loop_mode == "all" and player.current:
+        if player.loop_mode == LOOP_ALL and player.current:
             player.queue.append(player.current)
 
         if not player.queue:
@@ -702,19 +709,36 @@ class Music(commands.Cog):
             await player.current.refresh_source()
             if not voice_client or not voice_client.is_connected():
                 return
-            source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **player.current.get_ffmpeg_options())
-            source = discord.PCMVolumeTransformer(source, volume=player.volume)
-            voice_client.play(source, after=lambda e: self.play_next(guild_id, voice_client, text_channel, error=e))
-            player.start_time = time.time()
+            self._start_playback(player, guild_id, voice_client, text_channel)
             player.is_paused = False
+            player.consecutive_failures = 0
         except Exception as e:
             logger.error(f"Failed to play '{player.current.title}': {e}, skipping to next")
+            player.consecutive_failures += 1
+            if player.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                logger.error(f"{MAX_CONSECUTIVE_FAILURES} consecutive songs failed in guild {guild_id}, stopping playback")
+                player.current = None
+                player.consecutive_failures = 0
+                await self.cleanup_player(guild_id)
+                if text_channel:
+                    try:
+                        await text_channel.send("Stopped playback after multiple consecutive failures.")
+                    except Exception:
+                        pass
+                return
             player.retry_count = 0
             await self._play_next_async(guild_id, voice_client, text_channel, announce=announce)
             return
 
         if announce:
             await self.send_now_playing(guild_id, text_channel, player.current)
+
+    def _start_playback(self, player: MusicPlayer, guild_id: int, voice_client: discord.VoiceClient, text_channel: discord.TextChannel):
+        """Create audio source and start playing the current song on the voice client."""
+        source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **player.current.get_ffmpeg_options())
+        source = discord.PCMVolumeTransformer(source, volume=player.volume)
+        voice_client.play(source, after=lambda e: self.play_next(guild_id, voice_client, text_channel, error=e))
+        player.start_time = time.time()
 
     async def _retry_current_song(self, guild_id: int, voice_client: discord.VoiceClient, text_channel: discord.TextChannel):
         """Retry playing the current song by re-fetching the URL"""
@@ -732,10 +756,7 @@ class Music(commands.Cog):
 
         try:
             await player.current.refresh_source(force=True)
-            source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **player.current.get_ffmpeg_options())
-            source = discord.PCMVolumeTransformer(source, volume=player.volume)
-            player.start_time = time.time()
-            voice_client.play(source, after=lambda e: self.play_next(guild_id, voice_client, text_channel, error=e))
+            self._start_playback(player, guild_id, voice_client, text_channel)
         except Exception:
             logger.warning("Failed to retry song, skipping to next")
             player.retry_count = 0
@@ -778,9 +799,9 @@ class Music(commands.Cog):
 
         # Loop mode indicator
         loop_indicator = ""
-        if player.loop_mode == "one":
+        if player.loop_mode == LOOP_ONE:
             loop_indicator = " 🔂"
-        elif player.loop_mode == "all":
+        elif player.loop_mode == LOOP_ALL:
             loop_indicator = " 🔁"
 
         embed = discord.Embed(color=color)
@@ -1061,11 +1082,11 @@ class Music(commands.Cog):
             return await interaction.response.send_message("I'm not in a voice channel!", ephemeral=True)
 
         player = self.get_player(interaction.guild.id)
+        player.skip_next_callback = True
         player.queue.clear()
         player.current = None
-        player.loop_mode = "off"
+        player.loop_mode = LOOP_OFF
         player.is_paused = False
-        player.skip_next_callback = True
         if interaction.guild.voice_client.is_playing() or interaction.guild.voice_client.is_paused():
             interaction.guild.voice_client.stop()
         await interaction.response.send_message("Stopped and cleared the queue.")
@@ -1079,8 +1100,8 @@ class Music(commands.Cog):
             return await interaction.response.send_message("Nothing is playing!", ephemeral=True)
 
         player = self.get_player(interaction.guild.id)
-        if player.loop_mode == "one":
-            player.loop_mode = "off"
+        if player.loop_mode == LOOP_ONE:
+            player.loop_mode = LOOP_OFF
 
         player.start_time = 0  # Prevent premature end detection on intentional skip
         player.retry_count = 0
@@ -1273,13 +1294,12 @@ class Music(commands.Cog):
         player = self.get_player(interaction.guild.id)
 
         if mode is None:
-            modes = ["off", "one", "all"]
-            current_index = modes.index(player.loop_mode)
-            player.loop_mode = modes[(current_index + 1) % 3]
+            current_index = LOOP_MODES.index(player.loop_mode)
+            player.loop_mode = LOOP_MODES[(current_index + 1) % len(LOOP_MODES)]
         else:
             player.loop_mode = mode.value
 
-        icons = {"off": "->", "one": "(1)", "all": "(all)"}
+        icons = {LOOP_OFF: "->", LOOP_ONE: "(1)", LOOP_ALL: "(all)"}
         await interaction.response.send_message(f"Loop mode: **{player.loop_mode}** {icons[player.loop_mode]}")
 
     @app_commands.command(name="seek", description="Seek to a position in the current song")
