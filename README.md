@@ -1,123 +1,90 @@
-# Discord Music Bot
+<h1 align="center">Pythic</h1>
+<p align="center">A Discord music bot built with discord.py — plays YouTube audio with interactive controls, queue management, and playlist support.</p>
 
-A full-featured Discord music bot that plays music from YouTube with interactive controls.
+---
 
 ## Features
 
-- **Playback Controls**: play, pause, resume, stop, skip, previous, restart, seek
-- **Queue Management**: view queue, shuffle, remove, move, clear with pagination
-- **Playlist Support**: load full YouTube playlists, supports all URL formats
-- **Search & Select**: search YouTube and pick from top 10 results via dropdown
-- **Play Next**: insert a song at the front of the queue
-- **Loop Modes**: off, single track, entire queue
-- **Volume Control**: 0-100% with persistence across bot restarts
-- **Interactive Player**: embedded now-playing display with button controls
-- **Progress Tracking**: real-time progress bar and time remaining
-- **Auto-Recovery**: automatically retries playback on connection errors
-- **Auto-Cleanup**: player embeds are cleaned up when playback stops or bot restarts
-- **Auto-Disconnect**: leaves voice channel after 2 minutes of inactivity
+**Playback** — play, pause, resume, stop, skip, previous, restart, seek with real-time progress tracking
 
-## Requirements
+**Queue** — view, shuffle, move, remove, clear, loop (off / one / all) with paginated display
 
-- Python 3.10+
-- FFmpeg (system-installed)
-- Discord bot token
+**Playlists** — load full YouTube playlists from any URL format
+
+**Search** — search YouTube and pick from the top 10 results via dropdown
+
+**Interactive Player** — embedded now-playing display with button controls (shuffle, prev, pause/play, skip, loop, stop, refresh)
+
+**Smart Defaults** — volume persists across restarts, auto-recovery on connection errors, auto-disconnect after 2 min idle, auto-cleanup of player embeds
 
 ## Setup
 
-1. Create and activate a virtual environment:
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
+```bash
+# 1. Create and activate a virtual environment
+python3 -m venv venv
+source venv/bin/activate
 
-2. Install Python dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+# 2. Install dependencies
+pip install -r requirements.txt
 
-3. Ensure FFmpeg is installed:
-   ```bash
-   # Fedora/Bazzite (usually pre-installed)
-   ffmpeg -version
+# 3. Ensure FFmpeg is available
+ffmpeg -version
+# Fedora Atomic/Bazzite: rpm-ostree install ffmpeg
+# Ubuntu/Debian: sudo apt install ffmpeg
 
-   # If not installed on Fedora Atomic (Bazzite):
-   rpm-ostree install ffmpeg
+# 4. Set your bot token
+echo "DISCORD_TOKEN=your_token_here" > .env
 
-   # Ubuntu/Debian:
-   sudo apt install ffmpeg
-   ```
+# 5. Run
+python bot.py
+```
 
-4. Create a `.env` file:
-   ```
-   DISCORD_TOKEN=your_token_here
-   ```
+> Requires **Python 3.10+**, **FFmpeg**, and a **Discord bot token**.
 
-5. Run the bot:
-   ```bash
-   python bot.py
-   ```
+## Commands
 
-## Slash Commands
-
-All commands use Discord's slash command system (type `/` to see them).
+All commands use Discord's slash command system — type `/` to see them.
 
 ### Playback
 
 | Command | Description |
-|---------|-------------|
-| `/play <query>` | Play a song or playlist from YouTube (search, URL, or playlist) |
-| `/playnext <query>` | Add a song to play next in the queue |
+|---|---|
+| `/play <query>` | Play a song or playlist (search, URL, or playlist URL) |
+| `/playnext <query>` | Insert a song at the front of the queue |
 | `/pause` | Pause the current song |
 | `/resume` | Resume playback |
-| `/stop` | Stop playing and clear the queue |
+| `/stop` | Stop and clear the queue |
 | `/skip` | Skip to the next song |
 | `/previous` | Go back to the previous song |
-| `/restart` | Restart the current song from the beginning |
-| `/seek <timestamp>` | Seek to position (MM:SS or seconds) |
+| `/restart` | Restart the current song |
+| `/seek <timestamp>` | Seek to position (`MM:SS` or seconds) |
 
 ### Queue
 
 | Command | Description |
-|---------|-------------|
+|---|---|
 | `/queue` | Show the current queue |
-| `/nowplaying` | Show the currently playing song with controls |
-| `/refresh` | Refresh the player to show current progress |
+| `/nowplaying` | Show the current song with controls |
+| `/refresh` | Refresh the player progress display |
 | `/shuffle` | Shuffle the queue |
-| `/move <from> <to>` | Move a song to a different position in the queue |
+| `/move <from> <to>` | Move a song in the queue |
 | `/remove <position>` | Remove a song from the queue |
-| `/clear` | Clear the entire queue |
-| `/loop <mode>` | Set loop mode (off/one/all) |
+| `/clear` | Clear the queue |
+| `/loop [mode]` | Cycle or set loop mode (`off` / `one` / `all`) |
 
 ### Voice & Settings
 
 | Command | Description |
-|---------|-------------|
+|---|---|
 | `/join` | Join your voice channel |
 | `/leave` | Leave the voice channel |
-| `/volume <0-100>` | Set the volume |
-| `/help` | Show all available commands |
+| `/volume <0-100>` | Set playback volume (persists across restarts) |
+| `/help` | Show all commands |
 
-## Interactive Player Controls
+## Bot Token Setup
 
-When a song plays, an embedded player appears with button controls:
-
-- **Shuffle** - Shuffle the queue
-- **Previous** - Go to previous song
-- **Pause/Play** - Toggle playback
-- **Skip** - Skip to next song
-- **Loop** - Cycle through loop modes
-- **Stop** - Stop playback and clear queue
-- **Refresh** - Update the progress display
-
-## Getting a Discord Bot Token
-
-1. Go to https://discord.com/developers/applications
-2. Create a new application
-3. Go to "Bot" section and create a bot
-4. Copy the token
-5. Enable "Message Content Intent" under Privileged Gateway Intents
-6. Go to OAuth2 > URL Generator
-7. Select scopes: `bot`, `applications.commands`
-8. Select permissions: `Connect`, `Speak`, `Send Messages`, `Embed Links`, `Manage Messages`
-9. Use the generated URL to invite the bot to your server
+1. Go to [Discord Developer Portal](https://discord.com/developers/applications) and create a new application
+2. **Bot** section — create a bot, copy the token, enable **Message Content Intent**
+3. **OAuth2 > URL Generator** — select scopes `bot` + `applications.commands`
+4. Select permissions: **Connect**, **Speak**, **Send Messages**, **Embed Links**, **Manage Messages**
+5. Use the generated URL to invite the bot to your server
