@@ -802,6 +802,10 @@ class Music(commands.Cog):
         if len(current) < 2:
             return []
 
+        # Don't autocomplete URLs — let the user paste links directly
+        if current.startswith(('http://', 'https://', 'www.')):
+            return []
+
         results = await self.search_songs(current)
         return [
             app_commands.Choice(name=r['title'][:100], value=r['url'])
