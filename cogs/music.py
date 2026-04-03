@@ -577,8 +577,8 @@ class Music(commands.Cog):
                         'channel': e.get('channel') or e.get('uploader') or '',
                         'duration': e.get('duration') or 0,
                     } for e in info['entries'] if e]
-        except Exception:
-            pass
+        except Exception as ex:
+            logger.error(f"search_songs failed for '{query}': {ex}", exc_info=True)
         return []
 
     async def get_song(self, query: str) -> Optional[Song]:
