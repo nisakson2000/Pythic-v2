@@ -2,7 +2,6 @@ import asyncio
 import logging
 import random
 import re
-import subprocess
 import time
 import json
 from collections import deque
@@ -13,7 +12,6 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import yt_dlp
-import os
 import sys
 import shutil
 
@@ -327,10 +325,16 @@ class SongSelectView(discord.ui.View):
 
         options = []
         for i, r in enumerate(results[:10], 1):
+            desc_parts = []
+            if r.get('channel'):
+                desc_parts.append(r['channel'])
+            if r.get('duration'):
+                desc_parts.append(Song.format_duration(r['duration']))
+            description = ' \u00b7 '.join(desc_parts) if desc_parts else f"Result #{i}"
             options.append(discord.SelectOption(
                 label=r['title'][:100],
                 value=r['url'],
-                description=f"Result #{i}",
+                description=description[:100],
             ))
 
         select = discord.ui.Select(placeholder="Pick a song...", options=options)
@@ -387,7 +391,12 @@ class Music(commands.Cog):
         self.disconnect_tasks: dict[int, asyncio.Task] = {}  # Track disconnect timers per guild
 
     async def cog_load(self):
-        """Called when the cog is loaded - clean up any orphaned player messages from previous sessions"""
+        """Called when the cog is loaded - schedule orphaned message cleanup for after bot connects"""
+        self.bot.loop.create_task(self._deferred_cleanup())
+
+    async def _deferred_cleanup(self):
+        """Wait for bot to be ready (channel cache populated), then clean up orphaned messages"""
+        await self.bot.wait_until_ready()
         await self._cleanup_orphaned_messages()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -551,7 +560,12 @@ class Music(commands.Cog):
             with yt_dlp.YoutubeDL(YDL_SEARCH_OPTIONS) as ydl:
                 info = await loop.run_in_executor(None, lambda: ydl.extract_info(f"ytsearch10:{query}", download=False))
                 if 'entries' in info:
-                    return [{'title': e['title'][:80], 'url': e['url']} for e in info['entries'] if e]
+                    return [{
+                        'title': e['title'][:80],
+                        'url': e['url'],
+                        'channel': e.get('channel') or e.get('uploader') or '',
+                        'duration': e.get('duration') or 0,
+                    } for e in info['entries'] if e]
         except Exception:
             pass
         return []
@@ -656,12 +670,19 @@ class Music(commands.Cog):
         player.retry_count = 0
 
         if player.loop_mode == "one" and player.current:
-            await player.current.refresh_source()
-            source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **player.current.get_ffmpeg_options())
-            source = discord.PCMVolumeTransformer(source, volume=player.volume)
-            voice_client.play(source, after=lambda e: self.play_next(guild_id, voice_client, text_channel, error=e))
-            player.start_time = time.time()
-            return
+            try:
+                await player.current.refresh_source()
+                if not voice_client or not voice_client.is_connected():
+                    return
+                source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **player.current.get_ffmpeg_options())
+                source = discord.PCMVolumeTransformer(source, volume=player.volume)
+                voice_client.play(source, after=lambda e: self.play_next(guild_id, voice_client, text_channel, error=e))
+                player.start_time = time.time()
+                return
+            except Exception as e:
+                logger.warning(f"Failed to loop song '{player.current.title}': {e}, falling through to next")
+                player.loop_mode = "off"
+                # Fall through to normal queue progression
 
         # Add current song to history before moving on
         if player.current:
@@ -677,12 +698,20 @@ class Music(commands.Cog):
             return
 
         player.current = player.queue.popleft()
-        await player.current.refresh_source()
-        source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **player.current.get_ffmpeg_options())
-        source = discord.PCMVolumeTransformer(source, volume=player.volume)
-        voice_client.play(source, after=lambda e: self.play_next(guild_id, voice_client, text_channel, error=e))
-        player.start_time = time.time()
-        player.is_paused = False
+        try:
+            await player.current.refresh_source()
+            if not voice_client or not voice_client.is_connected():
+                return
+            source = discord.FFmpegPCMAudio(player.current.source, executable=FFMPEG_PATH, **player.current.get_ffmpeg_options())
+            source = discord.PCMVolumeTransformer(source, volume=player.volume)
+            voice_client.play(source, after=lambda e: self.play_next(guild_id, voice_client, text_channel, error=e))
+            player.start_time = time.time()
+            player.is_paused = False
+        except Exception as e:
+            logger.error(f"Failed to play '{player.current.title}': {e}, skipping to next")
+            player.retry_count = 0
+            await self._play_next_async(guild_id, voice_client, text_channel, announce=announce)
+            return
 
         if announce:
             await self.send_now_playing(guild_id, text_channel, player.current)
@@ -807,10 +836,25 @@ class Music(commands.Cog):
             return []
 
         results = await self.search_songs(current)
-        return [
-            app_commands.Choice(name=r['title'][:100], value=r['url'])
-            for r in results[:10]
-        ]
+        choices = []
+        for r in results[:10]:
+            suffix = ''
+            parts = []
+            if r.get('channel'):
+                parts.append(r['channel'])
+            if r.get('duration'):
+                parts.append(Song.format_duration(r['duration']))
+            if parts:
+                suffix = ' | ' + ' | '.join(parts)
+            # Ensure total fits in 100 chars, with at least 20 for title
+            max_title = 100 - len(suffix)
+            if max_title >= 20:
+                title = r['title'][:max_title]
+                name = title + suffix
+            else:
+                name = r['title'][:100]
+            choices.append(app_commands.Choice(name=name, value=r['url']))
+        return choices
 
     async def _ensure_voice(self, interaction: discord.Interaction) -> Optional[discord.VoiceClient]:
         """Connect to voice if needed, return voice client or None on failure. Assumes interaction is already deferred."""
@@ -1020,13 +1064,18 @@ class Music(commands.Cog):
         player.queue.clear()
         player.current = None
         player.loop_mode = "off"
-        interaction.guild.voice_client.stop()
+        player.is_paused = False
+        player.skip_next_callback = True
+        if interaction.guild.voice_client.is_playing() or interaction.guild.voice_client.is_paused():
+            interaction.guild.voice_client.stop()
         await interaction.response.send_message("Stopped and cleared the queue.")
+        await self.cleanup_player(interaction.guild.id)
+        await self.start_disconnect_timer(interaction.guild.id, interaction.guild.voice_client)
 
     @app_commands.command(name="skip", description="Skip the current song")
     async def skip(self, interaction: discord.Interaction):
         vc = interaction.guild.voice_client
-        if not vc or not vc.is_playing():
+        if not vc or (not vc.is_playing() and not vc.is_paused()):
             return await interaction.response.send_message("Nothing is playing!", ephemeral=True)
 
         player = self.get_player(interaction.guild.id)
@@ -1237,7 +1286,7 @@ class Music(commands.Cog):
     @app_commands.describe(timestamp="Position to seek to (format: MM:SS or seconds)")
     async def seek(self, interaction: discord.Interaction, timestamp: str):
         vc = interaction.guild.voice_client
-        if not vc or not vc.is_playing():
+        if not vc or (not vc.is_playing() and not vc.is_paused()):
             return await interaction.response.send_message("Nothing is playing!", ephemeral=True)
 
         player = self.get_player(interaction.guild.id)
@@ -1275,6 +1324,7 @@ class Music(commands.Cog):
         source = discord.PCMVolumeTransformer(source, volume=player.volume)
 
         player.start_time = time.time() - seconds
+        player.is_paused = False
 
         def after_seek(error):
             self.play_next(interaction.guild.id, vc, interaction.channel, error=error)
